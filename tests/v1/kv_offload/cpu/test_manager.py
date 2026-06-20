@@ -187,6 +187,66 @@ def test_filter_reused_manager_reports_stores_skipped_counter():
     assert stats.reduce()[STORES_SKIPPED] == 0
 
 
+def test_reuse_lru_prefers_colder_block_over_older_block():
+    manager = make_cpu_manager(num_blocks=3, cache_policy="reuse_lru")
+
+    manager.prepare_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+
+    # Make block 1 the oldest entry again, but with the highest reuse score.
+    manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.touch(to_keys([2]), _EMPTY_REQ_CTX)
+    manager.touch(to_keys([3]), _EMPTY_REQ_CTX)
+
+    output = manager.prepare_store(to_keys([4]), _EMPTY_REQ_CTX)
+    verify_store_output(
+        output,
+        ExpectedPrepareStoreOutput(
+            keys_to_store=[4],
+            store_block_ids=[1],
+            evicted_keys=[2],
+        ),
+    )
+
+
+def test_reuse_lru_seeds_eviction_priority_from_lookup_counts():
+    manager = make_cpu_manager(
+        num_blocks=2,
+        cache_policy="reuse_lru",
+        store_threshold=2,
+    )
+
+    for _ in range(3):
+        assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is False
+    for _ in range(2):
+        assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is False
+
+    output = manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    verify_store_output(
+        output,
+        ExpectedPrepareStoreOutput(
+            keys_to_store=[1, 2],
+            store_block_ids=[0, 1],
+            evicted_keys=[],
+        ),
+    )
+    manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+
+    for _ in range(2):
+        assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) is False
+
+    output = manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
+    verify_store_output(
+        output,
+        ExpectedPrepareStoreOutput(
+            keys_to_store=[3],
+            store_block_ids=[1],
+            evicted_keys=[2],
+        ),
+    )
+
+
 def test_cpu_manager():
     """
     Tests CPUOffloadingManager with lru policy.
