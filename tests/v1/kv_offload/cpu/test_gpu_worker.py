@@ -17,7 +17,10 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CpuGpuOffloadingHandlers,
+    RestoreDelayProfile,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -212,6 +215,68 @@ def test_transfer(
     handlers.gpu_to_cpu_handler.shutdown()
     if mmap_region:
         mmap_region.cleanup()
+
+
+@torch.inference_mode()
+def test_cpu_to_gpu_restore_delay_injection(default_vllm_config) -> None:
+    gpu_page_size_bytes = 256
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+    device = f"{DEVICE_TYPE}:0"
+
+    kv_cache_tensors = [
+        CanonicalKVCacheTensor(
+            tensor=torch.zeros(
+                (num_gpu_blocks, gpu_page_size_bytes),
+                dtype=torch.int8,
+                device=device,
+            ),
+            page_size_bytes=gpu_page_size_bytes,
+        )
+    ]
+    kv_caches = CanonicalKVCaches(
+        tensors=kv_cache_tensors,
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=gpu_page_size_bytes)]
+        ],
+    )
+
+    delay_profile = RestoreDelayProfile(
+        min_ms=25.0,
+        median_ms=25.0,
+        p99_ms=25.0,
+        max_ms=25.0,
+        seed=0,
+    )
+    handlers = CpuGpuOffloadingHandlers(
+        kv_caches=kv_caches,
+        block_size_factor=1,
+        num_cpu_blocks=num_cpu_blocks,
+        restore_delay_profile=delay_profile,
+    )
+    handler = handlers.cpu_to_gpu_handler
+
+    handler.src_tensors[0].random_()
+    handler.dst_tensors[0].random_()
+
+    src_spec = CPULoadStoreSpec([0, 1, 2])
+    dst_spec = GPULoadStoreSpec([0, 1, 2], group_sizes=(3,), block_indices=(0,))
+
+    start_time = time.perf_counter()
+    assert handler.transfer_async(1, (src_spec, dst_spec))
+    handler.wait({1})
+    elapsed = time.perf_counter() - start_time
+
+    # The injected 25ms delay should dominate the wall-clock submission path.
+    assert elapsed >= 0.020
+
+    finished = handler.get_finished()
+    assert finished
+    assert finished[0].job_id == 1
+    assert finished[0].success
+
+    handlers.cpu_to_gpu_handler.shutdown()
+    handlers.gpu_to_cpu_handler.shutdown()
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])

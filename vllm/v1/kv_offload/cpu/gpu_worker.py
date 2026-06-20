@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import math
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -33,6 +35,46 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class RestoreDelayProfile:
+    """Configurable latency model for CPU->GPU KV restore operations."""
+
+    min_ms: float
+    median_ms: float
+    p99_ms: float
+    max_ms: float
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.min_ms <= self.median_ms <= self.p99_ms <= self.max_ms):
+            raise ValueError(
+                "restore delay profile must satisfy "
+                "0 <= min <= median <= p99 <= max"
+            )
+
+    def sample_ms(self, rng: random.Random) -> float:
+        u = rng.random()
+        if u < 0.50:
+            return self._interp_band(self.min_ms, self.median_ms, u / 0.50)
+        if u < 0.99:
+            return self._interp_band(
+                self.median_ms,
+                self.p99_ms,
+                (u - 0.50) / 0.49,
+            )
+        return self._interp_band(self.p99_ms, self.max_ms, (u - 0.99) / 0.01)
+
+    @staticmethod
+    def _interp_band(lower: float, upper: float, alpha: float) -> float:
+        if lower == upper:
+            return lower
+        if lower <= 0.0:
+            return lower + alpha * (upper - lower)
+        log_lower = math.log(lower)
+        log_upper = math.log(upper)
+        return math.exp(log_lower + alpha * (log_upper - log_lower))
 
 
 def _select_swap_blocks_fn(
@@ -183,6 +225,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        restore_delay_profile: RestoreDelayProfile | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -229,6 +272,12 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.dst_block_size_factor = block_size_factor if self.gpu_to_cpu else 1
 
         self.transfer_type = ("GPU", "CPU") if self.gpu_to_cpu else ("CPU", "GPU")
+        self.restore_delay_profile = restore_delay_profile
+        self._rng = (
+            random.Random(restore_delay_profile.seed)
+            if restore_delay_profile is not None
+            else None
+        )
         # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
         self._mmap_region = mmap_region
         # job_id -> event
@@ -255,6 +304,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         num_src_blocks = len(src_blocks)
         num_dst_blocks = len(dst_blocks)
+
+        self._maybe_inject_restore_delay()
 
         # There are 2 types of transfers:
         # 1. GPU -> CPU
@@ -425,6 +476,15 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # success
         return True
 
+    def _maybe_inject_restore_delay(self) -> None:
+        if self.gpu_to_cpu:
+            return
+        if self.restore_delay_profile is None or self._rng is None:
+            return
+        delay_ms = self.restore_delay_profile.sample_ms(self._rng)
+        if delay_ms > 0:
+            time.sleep(delay_ms * 1e-3)
+
     @override
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
@@ -481,6 +541,7 @@ class CpuGpuOffloadingHandlers:
         block_size_factor: int,
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
+        restore_delay_profile: RestoreDelayProfile | None = None,
     ):
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
@@ -533,4 +594,5 @@ class CpuGpuOffloadingHandlers:
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            restore_delay_profile=restore_delay_profile,
         )

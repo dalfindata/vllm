@@ -18,6 +18,8 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 STORES_SKIPPED = "vllm:kv_offload_stores_skipped"
 
 
@@ -243,6 +245,26 @@ def test_reuse_lru_seeds_eviction_priority_from_lookup_counts():
             keys_to_store=[3],
             store_block_ids=[1],
             evicted_keys=[2],
+        ),
+    )
+
+
+def test_reuse_lru_falls_back_to_lru_when_scores_tie():
+    manager = make_cpu_manager(num_blocks=3, cache_policy="reuse_lru")
+
+    manager.prepare_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+
+    # Keep the default equal scores and make block 1 the oldest idle entry.
+    manager.touch(to_keys([2, 3]), _EMPTY_REQ_CTX)
+
+    output = manager.prepare_store(to_keys([4]), _EMPTY_REQ_CTX)
+    verify_store_output(
+        output,
+        ExpectedPrepareStoreOutput(
+            keys_to_store=[4],
+            store_block_ids=[0],
+            evicted_keys=[1],
         ),
     )
 

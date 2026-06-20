@@ -19,7 +19,10 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
 )
 from vllm.v1.kv_offload.cpu.common import METRIC_STORES_SKIPPED, CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CpuGpuOffloadingHandlers,
+    RestoreDelayProfile,
+)
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
@@ -88,6 +91,32 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._handlers: CpuGpuOffloadingHandlers | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
+        self.restore_delay_profile = self._build_restore_delay_profile()
+
+    def _build_restore_delay_profile(self) -> RestoreDelayProfile | None:
+        names = (
+            "restore_delay_min_ms",
+            "restore_delay_median_ms",
+            "restore_delay_p99_ms",
+            "restore_delay_max_ms",
+        )
+        values = {name: self.extra_config.get(name) for name in names}
+        if all(value is None for value in values.values()):
+            return None
+        missing = [name for name, value in values.items() if value is None]
+        if missing:
+            raise ValueError(
+                "restore delay injection requires all of "
+                "restore_delay_min_ms, restore_delay_median_ms, "
+                "restore_delay_p99_ms, and restore_delay_max_ms"
+            )
+        return RestoreDelayProfile(
+            min_ms=float(values["restore_delay_min_ms"]),
+            median_ms=float(values["restore_delay_median_ms"]),
+            p99_ms=float(values["restore_delay_p99_ms"]),
+            max_ms=float(values["restore_delay_max_ms"]),
+            seed=int(self.extra_config.get("restore_delay_seed", 0)),
+        )
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -119,6 +148,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
+            restore_delay_profile=self.restore_delay_profile,
         )
 
     @override
