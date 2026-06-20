@@ -15,15 +15,21 @@ class BlockStatus(ctypes.Structure):
     ref_cnt - the current number of transfers using this block as a source.
         A value of -1 indicates the block is not yet ready to be read.
     block_id - index of the physical CPU buffer slot.
+    reuse_score - a small reuse signal used by reuse-aware eviction policies.
     """
 
-    _fields_ = [("ref_cnt", ctypes.c_int32), ("block_id", ctypes.c_int64)]
+    _fields_ = [
+        ("ref_cnt", ctypes.c_int32),
+        ("block_id", ctypes.c_int64),
+        ("reuse_score", ctypes.c_int32),
+    ]
 
     def __init__(self, block_id: int):
         super().__init__()
         # initialize block as "not ready" (ref_cnt = -1)
         self.ref_cnt = -1
         self.block_id = block_id
+        self.reuse_score = 0
 
     @property
     def is_ready(self) -> bool:

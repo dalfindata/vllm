@@ -22,10 +22,12 @@ from vllm.v1.kv_offload.cpu.common import METRIC_STORES_SKIPPED, CPULoadStoreSpe
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.reuse_lru import ReuseLRUCachePolicy
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "reuse_lru": ReuseLRUCachePolicy,
 }
 
 
@@ -42,7 +44,7 @@ class CPUOffloadingManager(OffloadingManager):
     def __init__(
         self,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: Literal["lru", "arc", "reuse_lru"] = "lru",
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
@@ -102,6 +104,9 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> CPULoadStoreSpec:
         return CPULoadStoreSpec([block.block_id for block in blocks])
 
+    def _mark_reused(self, block: BlockStatus, increment: int = 1) -> None:
+        block.reuse_score = max(0, block.reuse_score + increment)
+
     # --- OffloadingManager interface ---
 
     @override
@@ -123,6 +128,7 @@ class CPUOffloadingManager(OffloadingManager):
             return False
         if not block.is_ready:
             return None  # write in-flight; caller should retry
+        self._mark_reused(block)
         return True
 
     @override
@@ -140,11 +146,16 @@ class CPUOffloadingManager(OffloadingManager):
                 self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
                 assert self._num_evictable_cache_blocks >= 0
             block.ref_cnt += 1
+            self._mark_reused(block)
             blocks.append(block)
         return self._get_load_store_spec(keys, blocks)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        for key in keys:
+            block = self._policy.get(key)
+            if block is not None and block.is_ready:
+                self._mark_reused(block)
         self._policy.touch(keys)
 
     @override
@@ -219,6 +230,8 @@ class CPUOffloadingManager(OffloadingManager):
         )
 
         for key, block in zip(keys_to_store, blocks):
+            if self.counts is not None:
+                block.reuse_score = max(0, self.counts.get(key, 0))
             self._policy.insert(key, block)
 
         # build store specs for allocated blocks
